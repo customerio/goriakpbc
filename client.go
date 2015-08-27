@@ -7,11 +7,9 @@ package riak
 import (
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/customerio/goriakpbc/pb"
@@ -29,15 +27,94 @@ protoc --go_out=. riak.proto
 
 // riak.Client the client interface
 type Client struct {
-	addr         string
-	tcpaddr      *net.TCPAddr
+	addr       string
+	tcpaddr    *net.TCPAddr
+	conn_count int
+	conns      chan *clientConnection
+	chanWait   time.Duration
+
 	readTimeout  time.Duration
 	writeTimeout time.Duration
-	conn_count   int
-	conns        chan *net.TCPConn
-	chanWait     time.Duration
 	connTimeout  time.Duration
-	connMutex    sync.RWMutex
+
+	connMutex sync.RWMutex
+}
+
+type clientConnection struct {
+	tcpaddr      *net.TCPAddr
+	conn         net.Conn
+	connTimeout  time.Duration
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+}
+
+func newClientConnection(connTimeout, readTimeout, writeTimeout time.Duration, tcpaddr *net.TCPAddr) *clientConnection {
+	return &clientConnection{
+		tcpaddr:      tcpaddr,
+		conn:         nil,
+		connTimeout:  connTimeout,
+		readTimeout:  readTimeout,
+		writeTimeout: writeTimeout,
+	}
+}
+
+func (c *clientConnection) close() {
+	if c.conn == nil {
+		return
+	}
+	c.conn.Close()
+	c.conn = nil
+}
+
+func (c *clientConnection) isActive() bool {
+	return c.conn != nil
+}
+
+func (c *clientConnection) dial() error {
+	if c.conn != nil {
+		return nil
+	}
+
+	d := new(net.Dialer)
+	if c.connTimeout > 0 {
+		d.Timeout = c.connTimeout
+	}
+
+	conn, err := d.Dial("tcp", c.tcpaddr.String())
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+
+	return nil
+}
+
+// Write data to the connection
+func (c *clientConnection) write(request []byte) (err error) {
+	c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	_, err = c.conn.Write(request)
+	if err != nil {
+		c.close()
+	}
+
+	return err
+}
+
+// Read data from the connection
+func (c *clientConnection) read(size int) (response []byte, err error) {
+	c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+
+	response = make([]byte, size)
+	s := 0
+	for i := 0; (size > 0) && (i < size); {
+		s, err = c.conn.Read(response[i:size])
+		i += s
+		if err != nil {
+			c.close()
+			return
+		}
+	}
+	return
 }
 
 /*
@@ -86,7 +163,7 @@ func NewClientPool(addr string, count int) *Client {
 	if count < 1 {
 		okCountSize = 1
 	}
-	ret := &Client{addr: addr, readTimeout: 1e8, writeTimeout: 1e8, conn_count: count, conns: make(chan *net.TCPConn, okCountSize)}
+	ret := &Client{addr: addr, readTimeout: 1e8, writeTimeout: 1e8, conn_count: count, conns: make(chan *clientConnection, okCountSize)}
 	ret.conns <- nil
 	return ret
 }
@@ -102,16 +179,22 @@ func (c *Client) SetConnectTimeout(timeout time.Duration) {
 	c.connTimeout = timeout
 }
 
-// Connects to a Riak server.
-func (c *Client) Connect() error {
-	d := new(net.Dialer)
-	if c.connTimeout > 0 {
-		d.Timeout = c.connTimeout
-	}
-	return c.tcpConnect(d)
+// Set the maximum time to wait for a connection to
+// be available in the pool. By default getConn() will wait forever.
+func (c *Client) SetChanWaitTimeout(waitTimeout time.Duration) {
+	c.chanWait = waitTimeout
 }
 
-func (c *Client) tcpConnect(dialer *net.Dialer) (err error) {
+func (c *Client) SetReadTimeout(timeout time.Duration) {
+	c.readTimeout = timeout
+}
+
+func (c *Client) SetWriteTimeout(timeout time.Duration) {
+	c.writeTimeout = timeout
+}
+
+// Connects to a Riak server.
+func (c *Client) Connect() error {
 	c.connMutex.RLock()
 	defer c.connMutex.RUnlock()
 	tcpaddr, err := net.ResolveTCPAddr("tcp", c.addr)
@@ -125,17 +208,18 @@ func (c *Client) tcpConnect(dialer *net.Dialer) (err error) {
 	} else if conn := <-c.conns; conn == nil {
 		// Create multiple connections to Riak and send these to the conns channel for later use
 		for i := 0; i < c.conn_count; i++ {
-			conn, err := dialer.Dial("tcp", tcpaddr.String())
+			conn := newClientConnection(c.connTimeout, c.readTimeout, c.writeTimeout, tcpaddr)
+			err := conn.dial()
 			if err != nil {
 				// Empty the conns channel before returning, in case an error appeared after a few
 				// successful connections.
 				for j := 0; j < i; j++ {
-					(<-c.conns).Close()
+					(<-c.conns).close()
 				}
 				c.conns <- nil
 				return err
 			}
-			c.conns <- conn.(*net.TCPConn)
+			c.conns <- conn
 		}
 	} else {
 		c.conns <- conn
@@ -155,34 +239,13 @@ func (c *Client) Close() {
 	// Close all the connections
 	for i := 0; i < c.conn_count-1; i++ {
 		conn := <-c.conns
-		conn.Close()
+		conn.close()
 	}
 	c.conns <- nil
 }
 
-// Write data to the connection
-func (c *Client) write(conn *net.TCPConn, request []byte) (err error) {
-	_, err = conn.Write(request)
-
-	return err
-}
-
-// Read data from the connection
-func (c *Client) read(conn *net.TCPConn, size int) (response []byte, err error) {
-	response = make([]byte, size)
-	s := 0
-	for i := 0; (size > 0) && (i < size); {
-		s, err = conn.Read(response[i:size])
-		i += s
-		if err != nil {
-			return
-		}
-	}
-	return
-}
-
 // Gets the TCP connection for a client (either the only one, or one from the pool)
-func (c *Client) getConn() (err error, conn *net.TCPConn) {
+func (c *Client) getConn() (err error, conn *clientConnection) {
 	timeout := time.After(c.chanWait)
 retry:
 	if c.chanWait > 0 {
@@ -195,6 +258,7 @@ retry:
 	} else {
 		conn = <-c.conns
 	}
+
 	// Connect if necessary
 	if conn == nil {
 		c.conns <- nil
@@ -204,17 +268,26 @@ retry:
 		}
 		goto retry
 	}
+
+	if conn != nil {
+		if !conn.isActive() {
+			err = conn.dial()
+			if err != nil {
+				return err, nil
+			}
+		}
+	}
 	return nil, conn
 }
 
 // Releases the TCP connection for use by subsequent requests
-func (c *Client) releaseConn(conn *net.TCPConn) {
+func (c *Client) releaseConn(conn *clientConnection) {
 	// Return this connection down the channel for re-use
 	c.conns <- conn
 }
 
 // Request serializes the data (using protobuf), adds the header and sends it to Riak.
-func (c *Client) request(req proto.Message, code byte) (err error, conn *net.TCPConn) {
+func (c *Client) request(req proto.Message, code byte) (err error, conn *clientConnection) {
 	err, conn = c.getConn()
 	if err != nil {
 		return err, nil
@@ -229,41 +302,24 @@ func (c *Client) request(req proto.Message, code byte) (err error, conn *net.TCP
 	msgbuf := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i), code}
 	msgbuf = append(msgbuf, pbmsg...)
 	// Send to Riak
-	err = c.write(conn, msgbuf)
+	err = conn.write(msgbuf)
 	// If an error occurred when sending request
 	if err != nil {
-		// Make sure connection will be released in the end
-		defer c.releaseConn(conn)
-
-		var errno syscall.Errno
-
-		// If the error is not recoverable like a broken pipe, close all connections,
-		// so next time when getConn() is called it will Connect() again
-		if operr, ok := err.(*net.OpError); ok {
-			if errno, ok = operr.Err.(syscall.Errno); ok {
-				if errno == syscall.EPIPE {
-					c.Close()
-				}
-			}
-		}
+		// close the connection, an error occurred.
+		c.releaseConn(conn)
 	}
 	return err, conn
 }
 
 // Reponse deserializes the data and returns a struct.
-func (c *Client) response(conn *net.TCPConn, response proto.Message) (err error) {
+func (c *Client) response(conn *clientConnection, response proto.Message) (err error) {
+	defer c.releaseConn(conn)
+
 	// Read the response from Riak
-	msgbuf, err := c.read(conn, 5)
+	msgbuf, err := conn.read(5)
 	if err != nil {
-		c.releaseConn(conn)
-		if err == io.EOF {
-			// Connection was closed, try to re-open the connection so subsequent
-			// i/o can succeed. Does report the error for this response.
-			c.Close()
-		}
 		return err
 	}
-	defer c.releaseConn(conn)
 
 	// Check the length
 	if len(msgbuf) < 5 {
@@ -271,7 +327,7 @@ func (c *Client) response(conn *net.TCPConn, response proto.Message) (err error)
 	}
 	// Read the message length, read the rest of the message if necessary
 	msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
-	pbmsg, err := c.read(conn, msglen-1)
+	pbmsg, err := conn.read(msglen - 1)
 	if err != nil {
 		return err
 	}
@@ -295,10 +351,11 @@ func (c *Client) response(conn *net.TCPConn, response proto.Message) (err error)
 
 // Reponse deserializes the data from a MapReduce response and returns the data,
 // this can come from multiple response messages
-func (c *Client) mr_response(conn *net.TCPConn) (response [][]byte, err error) {
+func (c *Client) mr_response(conn *clientConnection) (response [][]byte, err error) {
 	defer c.releaseConn(conn)
+
 	// Read the response from Riak
-	msgbuf, err := c.read(conn, 5)
+	msgbuf, err := conn.read(5)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +365,7 @@ func (c *Client) mr_response(conn *net.TCPConn) (response [][]byte, err error) {
 	}
 	// Read the message length, read the rest of the message if necessary
 	msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
-	pbmsg, err := c.read(conn, msglen-1)
+	pbmsg, err := conn.read(msglen - 1)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +388,7 @@ func (c *Client) mr_response(conn *net.TCPConn) (response [][]byte, err error) {
 		for done == nil {
 			partial = &pb.RpbMapRedResp{}
 			// Read another response
-			msgbuf, err = c.read(conn, 5)
+			msgbuf, err = conn.read(5)
 			if err != nil {
 				return nil, err
 			}
@@ -341,7 +398,7 @@ func (c *Client) mr_response(conn *net.TCPConn) (response [][]byte, err error) {
 			}
 			// Read the message length, read the rest of the message if necessary
 			msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
-			pbmsg, err := c.read(conn, msglen-1)
+			pbmsg, err := conn.read(msglen - 1)
 			if err != nil {
 				return nil, err
 			}
@@ -373,8 +430,9 @@ func (c *Client) mr_response(conn *net.TCPConn) (response [][]byte, err error) {
 
 // Deserializes the data from possibly multiple packets,
 // currently only for pb.RpbListKeysResp.
-func (c *Client) mp_response(conn *net.TCPConn) (response [][]byte, err error) {
+func (c *Client) mp_response(conn *clientConnection) (response [][]byte, err error) {
 	defer c.releaseConn(conn)
+
 	var (
 		partial *pb.RpbListKeysResp
 		msgcode byte
@@ -382,7 +440,7 @@ func (c *Client) mp_response(conn *net.TCPConn) (response [][]byte, err error) {
 
 	for {
 		// Read the response from Riak
-		msgbuf, err := c.read(conn, 5)
+		msgbuf, err := conn.read(5)
 		if err != nil {
 			return nil, err
 		}
@@ -392,7 +450,7 @@ func (c *Client) mp_response(conn *net.TCPConn) (response [][]byte, err error) {
 		}
 		// Read the message length, read the rest of the message if necessary
 		msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
-		pbmsg, err := c.read(conn, msglen-1)
+		pbmsg, err := conn.read(msglen - 1)
 		if err != nil {
 			return nil, err
 		}
@@ -437,7 +495,12 @@ func (c *Client) Ping() (err error) {
 	if err != nil {
 		return err
 	}
-	c.write(conn, msg)
+	err = conn.write(msg)
+	if err != nil {
+		c.releaseConn(conn)
+		return err
+	}
+
 	// Get response and return error if there was one
 	err = c.response(conn, nil)
 
@@ -452,7 +515,12 @@ func (c *Client) Id() (id string, err error) {
 	if err != nil {
 		return id, err
 	}
-	c.write(conn, msg)
+	err = conn.write(msg)
+	if err != nil {
+		c.releaseConn(conn)
+		return id, err
+	}
+
 	resp := &pb.RpbGetClientIdResp{}
 	err = c.response(conn, resp)
 	if err == nil {
@@ -479,7 +547,12 @@ func (c *Client) ServerVersion() (node string, version string, err error) {
 	if err != nil {
 		return node, version, err
 	}
-	c.write(conn, msg)
+	err = conn.write(msg)
+	if err != nil {
+		c.releaseConn(conn)
+		return node, version, err
+	}
+
 	resp := &pb.RpbGetServerInfoResp{}
 	err = c.response(conn, resp)
 	if err == nil {
@@ -487,10 +560,4 @@ func (c *Client) ServerVersion() (node string, version string, err error) {
 		version = string(resp.ServerVersion)
 	}
 	return node, version, err
-}
-
-// Set the maximum time to wait for a connection to
-// be available in the pool. By default getConn() will wait forever.
-func (c *Client) SetChanWaitTimeout(waitTimeout time.Duration) {
-	c.chanWait = waitTimeout
 }
