@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/customerio/goriakpbc/pb"
 	"github.com/golang/protobuf/proto"
-	"github.com/tpjg/goriakpbc/pb"
 )
 
 /*

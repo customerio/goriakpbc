@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/tpjg/goriakpbc/json"
+	"github.com/customerio/goriakpbc/json"
 )
 
 /*
