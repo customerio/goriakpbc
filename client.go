@@ -7,8 +7,11 @@ package riak
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"math"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -24,6 +27,8 @@ protoc --go_out=. riak.proto
 
 (or in case we also need search use "cat riak_pb/src/*.proto")
 */
+
+var logger = log.New(os.Stdout, "goriakpbc ", log.Ldate|log.Lmicroseconds)
 
 // riak.Client the client interface
 type Client struct {
@@ -82,6 +87,7 @@ func (c *clientConnection) dial() error {
 
 	conn, err := d.Dial("tcp", c.tcpaddr.String())
 	if err != nil {
+		logger.Printf("dial: `%s' failed: `%v'\n", c.tcpaddr.String(), err)
 		return err
 	}
 	c.conn = conn
@@ -89,10 +95,26 @@ func (c *clientConnection) dial() error {
 	return nil
 }
 
-var count int64
+//var count int64
 
 // Write data to the connection
 func (c *clientConnection) write(request []byte) (err error) {
+	/*
+		if c.writeTimeout > 0 {
+			if atomic.AddInt64(&count, 1)%10 == 0 {
+				c.conn.SetWriteDeadline(time.Now())
+			} else {
+				c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+			}
+		} else {
+			if atomic.AddInt64(&count, 1)%10 == 0 {
+				c.conn.SetWriteDeadline(time.Now())
+			} else {
+				c.conn.SetWriteDeadline(time.Time{})
+			}
+		}
+	*/
+
 	if c.writeTimeout > 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
@@ -103,6 +125,22 @@ func (c *clientConnection) write(request []byte) (err error) {
 
 // Read data from the connection
 func (c *clientConnection) read(size int) (response []byte, err error) {
+	/*
+		if c.readTimeout > 0 {
+			if atomic.AddInt64(&count, 1)%10 == 0 {
+				c.conn.SetReadDeadline(time.Now())
+			} else {
+				c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+			}
+		} else {
+			if atomic.AddInt64(&count, 1)%10 == 0 {
+				c.conn.SetReadDeadline(time.Now())
+			} else {
+				c.conn.SetReadDeadline(time.Time{})
+			}
+		}
+	*/
+
 	if c.readTimeout > 0 {
 		c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
 	}
@@ -343,6 +381,7 @@ func (c *Client) releaseConn(conn *clientConnection) {
 func (c *Client) requestReply(action func(c *clientConnection) error) error {
 	err, conn := c.getConn()
 	if err != nil {
+		logger.Printf("getConn failed: `%v'\n", err)
 		return err
 	}
 
@@ -353,14 +392,26 @@ func (c *Client) requestReply(action func(c *clientConnection) error) error {
 		return nil
 	}
 
+	retry := false
+
 	// Only retry on timeout or temporary network errors.
 	if nerr, ok := err.(net.Error); ok && (nerr.Temporary() || nerr.Timeout()) {
+		retry = true
+	} else if err == io.EOF {
+		retry = true
+	}
+
+	if retry {
+		logger.Printf("retry request: `%v'\n", err)
 		//fmt.Printf("retry due to %v\n", err)
 		err = conn.dial()
 		if err != nil {
-			return nil
+			return err
 		}
+
 		return action(conn)
+	} else {
+		logger.Printf("request failed due to `%v'\n", err)
 	}
 	return err
 }
