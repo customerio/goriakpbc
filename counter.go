@@ -32,13 +32,8 @@ func (c *Counter) Reload() (err error) {
 		}
 	}
 
-	err, conn := c.Bucket.client.request(req, rpbCounterGetReq)
-	if err != nil {
-		return err
-	}
-
 	resp := &pb.RpbCounterGetResp{}
-	err = c.Bucket.client.response(conn, resp)
+	err = c.Bucket.client.do(req, rpbCounterGetReq, resp)
 	if err != nil {
 		return err
 	}
@@ -89,13 +84,8 @@ func (c *Counter) increment(amount int64, reload bool) (err error) {
 		}
 	}
 
-	err, conn := c.Bucket.client.request(req, rpbCounterUpdateReq)
-	if err != nil {
-		return err
-	}
-
 	resp := &pb.RpbCounterUpdateResp{}
-	err = c.Bucket.client.response(conn, resp)
+	err = c.Bucket.client.do(req, rpbCounterUpdateReq, resp)
 	if err != nil {
 		return err
 	}
@@ -141,15 +131,7 @@ func (c *Counter) Destroy() (err error) {
 		}
 	}
 
-	err, conn := c.Bucket.client.request(req, rpbDelReq)
-	if err != nil {
-		return err
-	}
-	err = c.Bucket.client.response(conn, req)
-	if err != nil {
-		return err
-	}
-	return nil
+	return c.Bucket.client.do(req, rpbDelReq, req)
 }
 
 // Get a counter

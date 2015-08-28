@@ -3,11 +3,12 @@ package riak
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/bmizerany/assert"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bmizerany/assert"
 )
 
 const (

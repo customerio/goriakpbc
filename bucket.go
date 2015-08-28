@@ -1,8 +1,6 @@
 package riak
 
-import (
-	"github.com/customerio/goriakpbc/pb"
-)
+import "github.com/customerio/goriakpbc/pb"
 
 // Implements access to a bucket and its properties
 type Bucket struct {
@@ -25,14 +23,9 @@ func (c *Client) NewBucket(name string) (*Bucket, error) {
 	req := &pb.RpbGetBucketReq{
 		Bucket: []byte(name),
 	}
-	err, conn := c.request(req, rpbGetBucketReq)
-
-	if err != nil {
-		return nil, err
-	}
 	resp := &pb.RpbGetBucketResp{}
-	err = c.response(conn, resp)
 
+	err := c.do(req, rpbGetBucketReq, resp)
 	if err != nil {
 		return nil, err
 	}
@@ -57,14 +50,8 @@ func (c *Client) NewBucketType(btype, name string) (*Bucket, error) {
 		Bucket: []byte(name),
 		Type:   []byte(btype),
 	}
-	err, conn := c.request(req, rpbGetBucketReq)
-
-	if err != nil {
-		return nil, err
-	}
 	resp := &pb.RpbGetBucketResp{}
-	err = c.response(conn, resp)
-
+	err := c.do(req, rpbGetBucketReq, resp)
 	if err != nil {
 		return nil, err
 	}
@@ -117,11 +104,7 @@ func (b *Bucket) Search() bool {
 func (b *Bucket) SetSearch(search bool) (err error) {
 	props := &pb.RpbBucketProps{NVal: &b.nval, AllowMult: &b.allowMult, LastWriteWins: &b.lastWriteWins, Search: &search}
 	req := &pb.RpbSetBucketReq{Bucket: []byte(b.name), Type: []byte(b.bucket_type), Props: props}
-	err, conn := b.client.request(req, rpbSetBucketReq)
-	if err != nil {
-		return err
-	}
-	err = b.client.response(conn, req)
+	err = b.client.do(req, rpbSetBucketReq, req)
 	if err != nil {
 		return err
 	}
@@ -133,11 +116,7 @@ func (b *Bucket) SetSearch(search bool) (err error) {
 func (b *Bucket) SetNVal(nval uint32) (err error) {
 	props := &pb.RpbBucketProps{NVal: &nval, AllowMult: &b.allowMult, LastWriteWins: &b.lastWriteWins, Search: &b.search}
 	req := &pb.RpbSetBucketReq{Bucket: []byte(b.name), Type: []byte(b.bucket_type), Props: props}
-	err, conn := b.client.request(req, rpbSetBucketReq)
-	if err != nil {
-		return err
-	}
-	err = b.client.response(conn, req)
+	err = b.client.do(req, rpbSetBucketReq, req)
 	if err != nil {
 		return err
 	}
@@ -149,11 +128,7 @@ func (b *Bucket) SetNVal(nval uint32) (err error) {
 func (b *Bucket) SetAllowMult(allowMult bool) (err error) {
 	props := &pb.RpbBucketProps{NVal: &b.nval, AllowMult: &allowMult, LastWriteWins: &b.lastWriteWins, Search: &b.search}
 	req := &pb.RpbSetBucketReq{Bucket: []byte(b.name), Type: []byte(b.bucket_type), Props: props}
-	err, conn := b.client.request(req, rpbSetBucketReq)
-	if err != nil {
-		return err
-	}
-	err = b.client.response(conn, req)
+	err = b.client.do(req, rpbSetBucketReq, req)
 	if err != nil {
 		return err
 	}
@@ -165,11 +140,7 @@ func (b *Bucket) SetAllowMult(allowMult bool) (err error) {
 func (b *Bucket) SetLastWriteWins(lastWriteWins bool) (err error) {
 	props := &pb.RpbBucketProps{NVal: &b.nval, AllowMult: &b.allowMult, LastWriteWins: &lastWriteWins, Search: &b.search}
 	req := &pb.RpbSetBucketReq{Bucket: []byte(b.name), Type: []byte(b.bucket_type), Props: props}
-	err, conn := b.client.request(req, rpbSetBucketReq)
-	if err != nil {
-		return err
-	}
-	err = b.client.response(conn, req)
+	err = b.client.do(req, rpbSetBucketReq, req)
 	if err != nil {
 		return err
 	}
@@ -199,11 +170,7 @@ func (b *Bucket) Delete(key string, options ...map[string]uint32) (err error) {
 		}
 	}
 
-	err, conn := b.client.request(req, rpbDelReq)
-	if err != nil {
-		return err
-	}
-	err = b.client.response(conn, req)
+	err = b.client.do(req, rpbDelReq, req)
 	if err != nil {
 		return err
 	}
@@ -264,12 +231,8 @@ func (b *Bucket) Exists(key string, options ...map[string]uint32) (exists bool, 
 		}
 	}
 
-	err, conn := b.client.request(req, rpbGetReq)
-	if err != nil {
-		return false, err
-	}
 	resp := &pb.RpbGetResp{}
-	err = b.client.response(conn, resp)
+	err = b.client.do(req, rpbGetReq, resp)
 	if err != nil {
 		return false, err
 	}
@@ -289,12 +252,8 @@ func (c *Client) ExistsIn(bucketname string, key string, options ...map[string]u
 func (b *Bucket) IndexQuery(index string, key string) (keys []string, err error) {
 	req := &pb.RpbIndexReq{Bucket: []byte(b.name), Type: []byte(b.bucket_type), Index: []byte(index),
 		Qtype: pb.RpbIndexReq_eq.Enum(), Key: []byte(key)}
-	err, conn := b.client.request(req, rpbIndexReq)
-	if err != nil {
-		return nil, err
-	}
 	resp := &pb.RpbIndexResp{}
-	err = b.client.response(conn, resp)
+	err = b.client.do(req, rpbIndexReq, resp)
 	if err != nil {
 		return nil, err
 	}
@@ -315,12 +274,8 @@ func (b *Bucket) IndexQueryPage(index string, key string, results uint32, contin
 		req.Continuation = []byte(continuation)
 	}
 
-	err, conn := b.client.request(req, rpbIndexReq)
-	if err != nil {
-		return nil, "", err
-	}
 	resp := &pb.RpbIndexResp{}
-	err = b.client.response(conn, resp)
+	err = b.client.do(req, rpbIndexReq, resp)
 	if err != nil {
 		return nil, "", err
 	}
@@ -338,12 +293,8 @@ func (b *Bucket) IndexQueryRange(index string, min string, max string) (keys []s
 	req := &pb.RpbIndexReq{Bucket: []byte(b.name), Type: []byte(b.bucket_type), Index: []byte(index),
 		Qtype:    pb.RpbIndexReq_range.Enum(),
 		RangeMin: []byte(min), RangeMax: []byte(max)}
-	err, conn := b.client.request(req, rpbIndexReq)
-	if err != nil {
-		return nil, err
-	}
 	resp := &pb.RpbIndexResp{}
-	err = b.client.response(conn, resp)
+	err = b.client.do(req, rpbIndexReq, resp)
 	if err != nil {
 		return nil, err
 	}
@@ -365,12 +316,8 @@ func (b *Bucket) IndexQueryRangePage(index string, min string, max string, resul
 		req.Continuation = []byte(continuation)
 	}
 
-	err, conn := b.client.request(req, rpbIndexReq)
-	if err != nil {
-		return nil, "", err
-	}
 	resp := &pb.RpbIndexResp{}
-	err = b.client.response(conn, resp)
+	err = b.client.do(req, rpbIndexReq, resp)
 	if err != nil {
 		return nil, "", err
 	}
@@ -387,10 +334,5 @@ func (b *Bucket) IndexQueryRangePage(index string, min string, max string, resul
 func (b *Bucket) ListKeys() (response [][]byte, err error) {
 	req := &pb.RpbListKeysReq{Bucket: []byte(b.name), Type: []byte(b.bucket_type)}
 
-	err, conn := b.client.request(req, rpbListKeysReq)
-	if err != nil {
-		return nil, err
-	}
-
-	return b.client.mp_response(conn)
+	return b.client.domp(req, rpbListKeysReq)
 }

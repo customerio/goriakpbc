@@ -66,18 +66,18 @@ func (c *clientConnection) close() {
 	c.conn = nil
 }
 
-func (c *clientConnection) isActive() bool {
+func (c *clientConnection) isConnected() bool {
 	return c.conn != nil
 }
 
 func (c *clientConnection) dial() error {
 	if c.conn != nil {
-		return nil
+		c.conn.Close()
+		c.conn = nil
 	}
 
-	d := new(net.Dialer)
-	if c.connTimeout > 0 {
-		d.Timeout = c.connTimeout
+	d := net.Dialer{
+		Timeout: c.connTimeout,
 	}
 
 	conn, err := d.Dial("tcp", c.tcpaddr.String())
@@ -89,20 +89,23 @@ func (c *clientConnection) dial() error {
 	return nil
 }
 
+var count int64
+
 // Write data to the connection
 func (c *clientConnection) write(request []byte) (err error) {
-	c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-	_, err = c.conn.Write(request)
-	if err != nil {
-		c.close()
+	if c.writeTimeout > 0 {
+		c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 
+	_, err = c.conn.Write(request)
 	return err
 }
 
 // Read data from the connection
 func (c *clientConnection) read(size int) (response []byte, err error) {
-	c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	if c.readTimeout > 0 {
+		c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	}
 
 	response = make([]byte, size)
 	s := 0
@@ -110,11 +113,61 @@ func (c *clientConnection) read(size int) (response []byte, err error) {
 		s, err = c.conn.Read(response[i:size])
 		i += s
 		if err != nil {
-			c.close()
 			return
 		}
 	}
 	return
+}
+
+func (c *clientConnection) send(req proto.Message, code byte) error {
+	// Serialize the request using protobuf
+	pbmsg, err := proto.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	// Build message with header: <length:32> <msg_code:8> <pbmsg>
+	i := int32(len(pbmsg) + 1)
+	msgbuf := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i), code}
+	msgbuf = append(msgbuf, pbmsg...)
+	// Send to Riak
+	return c.write(msgbuf)
+}
+
+func (c *clientConnection) recv(response proto.Message) (err error) {
+	// Read the response from Riak
+	msgbuf, err := c.read(5)
+	if err != nil {
+		return err
+	}
+
+	// Check the length
+	if len(msgbuf) < 5 {
+		return BadResponseLength
+	}
+	// Read the message length, read the rest of the message if necessary
+	msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
+
+	pbmsg, err := c.read(msglen - 1)
+	if err != nil {
+		return err
+	}
+
+	// Deserialize, by default the calling method should provide the expected RbpXXXResp
+	msgcode := msgbuf[4]
+	switch msgcode {
+	case rpbErrorResp:
+		errResp := &pb.RpbErrorResp{}
+		err = proto.Unmarshal(pbmsg, errResp)
+		if err == nil {
+			err = errors.New(string(errResp.GetErrmsg()))
+		}
+	case rpbPingResp, rpbSetClientIdResp, rpbSetBucketResp, rpbDelResp:
+		return nil
+	default:
+		err = proto.Unmarshal(pbmsg, response)
+	}
+	return err
 }
 
 /*
@@ -163,7 +216,7 @@ func NewClientPool(addr string, count int) *Client {
 	if count < 1 {
 		okCountSize = 1
 	}
-	ret := &Client{addr: addr, readTimeout: 1e8, writeTimeout: 1e8, conn_count: count, conns: make(chan *clientConnection, okCountSize)}
+	ret := &Client{addr: addr, readTimeout: 0, writeTimeout: 0, conn_count: count, conns: make(chan *clientConnection, okCountSize)}
 	ret.conns <- nil
 	return ret
 }
@@ -268,16 +321,17 @@ retry:
 		}
 		goto retry
 	}
-
 	if conn != nil {
-		if !conn.isActive() {
+		if !conn.isConnected() {
 			err = conn.dial()
 			if err != nil {
+				// Put the connection back on the queue.
+				c.conns <- conn
 				return err, nil
 			}
 		}
 	}
-	return nil, conn
+	return err, conn
 }
 
 // Releases the TCP connection for use by subsequent requests
@@ -286,191 +340,176 @@ func (c *Client) releaseConn(conn *clientConnection) {
 	c.conns <- conn
 }
 
-// Request serializes the data (using protobuf), adds the header and sends it to Riak.
-func (c *Client) request(req proto.Message, code byte) (err error, conn *clientConnection) {
-	err, conn = c.getConn()
+func (c *Client) requestReply(action func(c *clientConnection) error) error {
+	err, conn := c.getConn()
 	if err != nil {
-		return err, nil
+		return err
 	}
-	// Serialize the request using protobuf
-	pbmsg, err := proto.Marshal(req)
-	if err != nil {
-		return err, conn
-	}
-	// Build message with header: <length:32> <msg_code:8> <pbmsg>
-	i := int32(len(pbmsg) + 1)
-	msgbuf := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i), code}
-	msgbuf = append(msgbuf, pbmsg...)
-	// Send to Riak
-	err = conn.write(msgbuf)
-	// If an error occurred when sending request
-	if err != nil {
-		// close the connection, an error occurred.
-		c.releaseConn(conn)
-		conn = nil
-	}
-	return err, conn
-}
 
-// Reponse deserializes the data and returns a struct.
-func (c *Client) response(conn *clientConnection, response proto.Message) (err error) {
 	defer c.releaseConn(conn)
 
-	// Read the response from Riak
-	msgbuf, err := conn.read(5)
-	if err != nil {
-		return err
-	}
-
-	// Check the length
-	if len(msgbuf) < 5 {
-		return BadResponseLength
-	}
-	// Read the message length, read the rest of the message if necessary
-	msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
-	pbmsg, err := conn.read(msglen - 1)
-	if err != nil {
-		return err
-	}
-
-	// Deserialize, by default the calling method should provide the expected RbpXXXResp
-	msgcode := msgbuf[4]
-	switch msgcode {
-	case rpbErrorResp:
-		errResp := &pb.RpbErrorResp{}
-		err = proto.Unmarshal(pbmsg, errResp)
-		if err == nil {
-			err = errors.New(string(errResp.GetErrmsg()))
-		}
-	case rpbPingResp, rpbSetClientIdResp, rpbSetBucketResp, rpbDelResp:
+	err = action(conn)
+	if err == nil {
 		return nil
-	default:
-		err = proto.Unmarshal(pbmsg, response)
+	}
+
+	// Only retry on timeout or temporary network errors.
+	if nerr, ok := err.(net.Error); ok && (nerr.Temporary() || nerr.Timeout()) {
+		//fmt.Printf("retry due to %v\n", err)
+		err = conn.dial()
+		if err != nil {
+			return nil
+		}
+		return action(conn)
 	}
 	return err
 }
 
-// Reponse deserializes the data from a MapReduce response and returns the data,
-// this can come from multiple response messages
-func (c *Client) mr_response(conn *clientConnection) (response [][]byte, err error) {
-	defer c.releaseConn(conn)
-
-	// Read the response from Riak
-	msgbuf, err := conn.read(5)
-	if err != nil {
-		return nil, err
-	}
-	// Check the length
-	if len(msgbuf) < 5 {
-		return nil, BadResponseLength
-	}
-	// Read the message length, read the rest of the message if necessary
-	msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
-	pbmsg, err := conn.read(msglen - 1)
-	if err != nil {
-		return nil, err
-	}
-
-	// Deserialize, by default the calling method should provide the expected RbpXXXResp
-	msgcode := msgbuf[4]
-	if msgcode == rpbMapRedResp {
-		partial := &pb.RpbMapRedResp{}
-		err = proto.Unmarshal(pbmsg, partial)
+func (c *Client) do(req proto.Message, code byte, response proto.Message) (err error) {
+	return c.requestReply(func(conn *clientConnection) error {
+		err = conn.send(req, code)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		done := partial.Done
-		var resp [][]byte = nil
-		if partial.Response != nil {
-			resp = make([][]byte, 1)
-			resp[0] = partial.Response
+		return conn.recv(response)
+	})
+}
+
+// Deserializes the data from possibly multiple packets,
+// currently only for pb.RpbListKeysResp.
+func (c *Client) domp(req proto.Message, code byte) (response [][]byte, err error) {
+	err = c.requestReply(func(conn *clientConnection) error {
+		response = nil
+
+		err := conn.send(req, code)
+		if err != nil {
+			return err
 		}
 
-		for done == nil {
-			partial = &pb.RpbMapRedResp{}
-			// Read another response
-			msgbuf, err = conn.read(5)
+		var (
+			partial *pb.RpbListKeysResp
+			msgcode byte
+		)
+
+		for {
+			// Read the response from Riak
+			msgbuf, err := conn.read(5)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			// Check the length
 			if len(msgbuf) < 5 {
-				return nil, BadResponseLength
+				return BadResponseLength
 			}
 			// Read the message length, read the rest of the message if necessary
 			msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
 			pbmsg, err := conn.read(msglen - 1)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			err = proto.Unmarshal(pbmsg, partial)
-			if err != nil {
-				return nil, err
-			}
-			done = partial.Done
-			if partial.Response != nil {
-				resp = append(resp, partial.Response)
+
+			// Deserialize, by default the calling method should provide the expected RbpXXXResp
+			msgcode = msgbuf[4]
+
+			if msgcode == rpbListKeysResp {
+				partial = &pb.RpbListKeysResp{}
+				err = proto.Unmarshal(pbmsg, partial)
+				if err != nil {
+					return err
+				}
+
+				response = append(response, partial.Keys...)
+
+				if partial.Done != nil {
+					break
+				}
+			} else if msgcode == rpbErrorResp {
+				errResp := &pb.RpbErrorResp{}
+				err = proto.Unmarshal(pbmsg, errResp)
+				if err == nil {
+					err = errors.New(string(errResp.Errmsg))
+				} else {
+					err = fmt.Errorf("Cannot deserialize error response from Riak - %v", err)
+				}
+				return err
+			} else {
+				return err
 			}
 		}
-		response = resp
-		return
-	} else if msgcode == rpbErrorResp {
-		errResp := &pb.RpbErrorResp{}
-		err = proto.Unmarshal(pbmsg, errResp)
-		if err == nil {
-			err = errors.New(string(errResp.Errmsg))
-		} else {
-			err = fmt.Errorf("Cannot deserialize error response from Riak - %v", err)
-		}
-		return nil, err
-	} else {
-		return nil, err
-	}
+		return nil
+	})
 	return
 }
 
-// Deserializes the data from possibly multiple packets,
-// currently only for pb.RpbListKeysResp.
-func (c *Client) mp_response(conn *clientConnection) (response [][]byte, err error) {
-	defer c.releaseConn(conn)
+// Reponse deserializes the data from a MapReduce response and returns the data,
+// this can come from multiple response messages
+func (c *Client) domr(req proto.Message, code byte) (response [][]byte, err error) {
+	err = c.requestReply(func(conn *clientConnection) error {
+		err := conn.send(req, code)
+		if err != nil {
+			return err
+		}
 
-	var (
-		partial *pb.RpbListKeysResp
-		msgcode byte
-	)
-
-	for {
 		// Read the response from Riak
 		msgbuf, err := conn.read(5)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		// Check the length
 		if len(msgbuf) < 5 {
-			return nil, BadResponseLength
+			return BadResponseLength
 		}
 		// Read the message length, read the rest of the message if necessary
 		msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
 		pbmsg, err := conn.read(msglen - 1)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		// Deserialize, by default the calling method should provide the expected RbpXXXResp
-		msgcode = msgbuf[4]
-
-		if msgcode == rpbListKeysResp {
-			partial = &pb.RpbListKeysResp{}
+		msgcode := msgbuf[4]
+		if msgcode == rpbMapRedResp {
+			partial := &pb.RpbMapRedResp{}
 			err = proto.Unmarshal(pbmsg, partial)
 			if err != nil {
-				return nil, err
+				return err
+			}
+			done := partial.Done
+			var resp [][]byte = nil
+			if partial.Response != nil {
+				resp = make([][]byte, 1)
+				resp[0] = partial.Response
 			}
 
-			response = append(response, partial.Keys...)
-
-			if partial.Done != nil {
-				break
+			for done == nil {
+				partial = &pb.RpbMapRedResp{}
+				// Read another response
+				msgbuf, err = conn.read(5)
+				if err != nil {
+					return err
+				}
+				// Check the length
+				if len(msgbuf) < 5 {
+					return BadResponseLength
+				}
+				// Read the message length, read the rest of the message if necessary
+				msglen := int(msgbuf[0])<<24 + int(msgbuf[1])<<16 + int(msgbuf[2])<<8 + int(msgbuf[3])
+				pbmsg, err := conn.read(msglen - 1)
+				if err != nil {
+					return err
+				}
+				err = proto.Unmarshal(pbmsg, partial)
+				if err != nil {
+					return err
+				}
+				done = partial.Done
+				if partial.Response != nil {
+					resp = append(resp, partial.Response)
+				}
 			}
+
+			response = resp
+			return nil
 		} else if msgcode == rpbErrorResp {
 			errResp := &pb.RpbErrorResp{}
 			err = proto.Unmarshal(pbmsg, errResp)
@@ -479,12 +518,10 @@ func (c *Client) mp_response(conn *clientConnection) (response [][]byte, err err
 			} else {
 				err = fmt.Errorf("Cannot deserialize error response from Riak - %v", err)
 			}
-			return nil, err
-		} else {
-			return nil, err
+			return err
 		}
-	}
-
+		return err
+	})
 	return
 }
 
@@ -492,73 +529,59 @@ func (c *Client) mp_response(conn *clientConnection) (response [][]byte, err err
 func (c *Client) Ping() (err error) {
 	// Use hardcoded request, no need to serialize
 	msg := []byte{0, 0, 0, 1, rpbPingReq}
-	err, conn := c.getConn()
-	if err != nil {
-		return err
-	}
-	err = conn.write(msg)
-	if err != nil {
-		c.releaseConn(conn)
-		return err
-	}
+	return c.requestReply(func(conn *clientConnection) error {
+		err = conn.write(msg)
+		if err != nil {
+			return err
+		}
 
-	// Get response and return error if there was one
-	err = c.response(conn, nil)
-
-	return err
+		// Get response and return error if there was one
+		return conn.recv(nil)
+	})
 }
 
 // Get the client Id
 func (c *Client) Id() (id string, err error) {
 	// Use hardcoded request, no need to serialize
 	msg := []byte{0, 0, 0, 1, rpbGetClientIdReq}
-	err, conn := c.getConn()
-	if err != nil {
-		return id, err
-	}
-	err = conn.write(msg)
-	if err != nil {
-		c.releaseConn(conn)
-		return id, err
-	}
+	err = c.requestReply(func(conn *clientConnection) error {
+		err := conn.write(msg)
+		if err != nil {
+			return err
+		}
 
-	resp := &pb.RpbGetClientIdResp{}
-	err = c.response(conn, resp)
-	if err == nil {
-		id = string(resp.ClientId)
-	}
+		resp := &pb.RpbGetClientIdResp{}
+		err = conn.recv(resp)
+		if err == nil {
+			id = string(resp.ClientId)
+		}
+		return err
+	})
 	return id, err
 }
 
 // Set the client Id
 func (c *Client) SetId(id string) (err error) {
 	req := &pb.RpbSetClientIdReq{ClientId: []byte(id)}
-	err, conn := c.request(req, rpbSetClientIdReq)
-	if err != nil {
-		return err
-	}
-	err = c.response(conn, req)
-	return err
+	return c.do(req, rpbSetClientIdReq, req)
 }
 
 // Get the server version
 func (c *Client) ServerVersion() (node string, version string, err error) {
 	msg := []byte{0, 0, 0, 1, rpbGetServerInfoReq}
-	err, conn := c.getConn()
-	if err != nil {
-		return node, version, err
-	}
-	err = conn.write(msg)
-	if err != nil {
-		c.releaseConn(conn)
-		return node, version, err
-	}
+	err = c.requestReply(func(conn *clientConnection) error {
+		err := conn.write(msg)
+		if err != nil {
+			return err
+		}
 
-	resp := &pb.RpbGetServerInfoResp{}
-	err = c.response(conn, resp)
-	if err == nil {
-		node = string(resp.Node)
-		version = string(resp.ServerVersion)
-	}
+		resp := &pb.RpbGetServerInfoResp{}
+		err = conn.recv(resp)
+		if err == nil {
+			node = string(resp.Node)
+			version = string(resp.ServerVersion)
+		}
+		return err
+	})
 	return node, version, err
 }

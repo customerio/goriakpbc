@@ -2,6 +2,7 @@ package riak
 
 import (
 	"fmt"
+
 	"github.com/bmizerany/assert"
 
 	"testing"

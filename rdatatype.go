@@ -69,12 +69,8 @@ func (b *Bucket) fetch(key string, options ...map[string]uint32) (obj RDataType,
 			}
 		}
 	}
-	err, conn := b.client.request(req, dtFetchReq)
-	if err != nil {
-		return nil, err
-	}
 	resp := &pb.DtFetchResp{}
-	err = b.client.response(conn, resp)
+	err = b.client.do(req, dtFetchReq, resp)
 	if err != nil {
 		return nil, err
 	}
@@ -133,13 +129,9 @@ func (m RDataTypeObject) store(op *pb.DtOp) (err error) {
 	}
 
 	// Send the request
-	err, conn := m.Bucket.client.request(req, dtUpdateReq)
-	if err != nil {
-		return err
-	}
 	// Get response, ReturnHead is true, so we can store the vclock
 	resp := &pb.DtUpdateResp{}
-	err = m.Bucket.client.response(conn, resp)
+	err = m.Bucket.client.do(req, dtUpdateReq, resp)
 	if err != nil {
 		return err
 	}
@@ -171,11 +163,7 @@ func (obj *RDataTypeObject) Destroy() (err error) {
 		}
 	}
 
-	err, conn := obj.Bucket.client.request(req, rpbDelReq)
-	if err != nil {
-		return err
-	}
-	err = obj.Bucket.client.response(conn, req)
+	err = obj.Bucket.client.do(req, rpbDelReq, req)
 	if err != nil {
 		return err
 	}

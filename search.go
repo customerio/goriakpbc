@@ -41,16 +41,12 @@ func (c *Client) Search(s *Search) ([]map[string][]byte, float32, uint32, error)
 		req.Presort = []byte(s.PreSort)
 	}
 
-	err, conn := c.request(req, rpbSearchQueryReq)
+	resp := &pb.RpbSearchQueryResp{}
+	err := c.do(req, rpbSearchQueryReq, resp)
 	if err != nil {
 		return nil, 0.0, 0, err
 	}
 
-	resp := &pb.RpbSearchQueryResp{}
-	err = c.response(conn, resp)
-	if err != nil {
-		return nil, 0.0, 0, err
-	}
 	docs := resp.GetDocs()
 
 	res := make([]map[string][]byte, len(docs))
